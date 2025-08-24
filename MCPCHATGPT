@@ -1,1 +1,441 @@
+    #!/usr/bin/env python3
+"""
+Power BI REST – FastAPI + FastMCP (SIN aprobaciones)
+
+- Endpoints REST explícitos (/mcp/tools/*) de SOLO LECTURA
+- Sub-app MCP aislado en /_mcp (herramientas FastMCP)
+- Cache de token (CLIENT CREDENTIALS)
+- Detalle de dataset, lakehouses, escaneo y catálogo
+- GET y POST espejados (POST sin body requerido)
+- OpenAPI marca x-openai-isConsequential=false en lecturas
+- CORS y OPTIONS preflight habilitados
+"""
+
+import json
+import os
+import tempfile
+import time
+from typing import List, Optional
+
+import msal
+import pandas as pd
+import requests
+from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+from fastmcp import FastMCP
+
+# ────────────────────────────── Configuración / Credenciales (usar variables de entorno)
+TENANT_ID = os.getenv("TENANT_ID", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE = ["https://analysis.windows.net/powerbi/api/.default"]
+PBI_API = "https://api.powerbi.com/v1.0/myorg"
+SERVER_URL = os.getenv("SERVER_URL", "https://pbi-plugin-app.azurewebsites.net")
+
+TOKEN_CACHE_SECONDS = int(os.getenv("TOKEN_CACHE_SECONDS", "300"))  # 5 min
+REQ_TIMEOUT = int(os.getenv("REQ_TIMEOUT", "30"))  # seg
+
+# ────────────────────────────── App principal
+app = FastAPI(
+    title="PowerBI Admin Tools API",
+    version="1.4.0",
+    description="Endpoints de administración de Power BI (REST + MCP).",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Responder cualquier OPTIONS (preflight CORS) — NO se documenta en OpenAPI
+@app.options("/{path:path}")
+def options_any(path: str):
+    return Response(status_code=204)
+
+if os.path.exists("index.html"):
+    app.mount("/", StaticFiles(directory="."), name="static-root")
+
+# Salud / raíz
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"message": "¡API de administración Power BI activa11111!"}
+
+# ────────────────────────────── Token cache (client credentials)
+_token_cache: Optional[str] = None
+_token_expiry: float = 0.0
+
+def _token() -> str:
+    global _token_cache, _token_expiry
+    now = time.time()
+    if _token_cache and now < _token_expiry:
+        return _token_cache
+
+    aad = msal.ConfidentialClientApplication(
+        CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
+    )
+    res = aad.acquire_token_for_client(scopes=SCOPE)
+    if "access_token" not in res:
+        raise HTTPException(status_code=401, detail=res)
+
+    _token_cache = res["access_token"]
+    ttl = int(res.get("expires_in", TOKEN_CACHE_SECONDS))
+    _token_expiry = now + min(ttl, TOKEN_CACHE_SECONDS)
+    return _token_cache
+
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {_token()}"}
+
+# ────────────────────────────── Helpers HTTP a Power BI (propagan error real)
+def _pbi_get(path: str) -> dict:
+    url = f"{PBI_API}{path}"
+    try:
+        r = requests.get(url, headers=_headers(), timeout=REQ_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Network to Power BI failed: {e}")
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code,
+                            detail={"upstream_url": url, "upstream_body": r.text[:800]})
+    try:
+        return r.json()
+    except ValueError:
+        raise HTTPException(status_code=502,
+                            detail={"upstream_url": url, "non_json_body": r.text[:800]})
+
+def _pbi_post(path: str, body: dict) -> dict:
+    url = f"{PBI_API}{path}"
+    try:
+        r = requests.post(url, headers=_headers(), json=body, timeout=REQ_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Network to Power BI failed: {e}")
+    if r.status_code in (200, 201, 202):
+        try:
+            return r.json()
+        except ValueError:
+            raise HTTPException(status_code=502,
+                                detail={"upstream_url": url, "non_json_body": r.text[:800]})
+    raise HTTPException(status_code=r.status_code,
+                        detail={"upstream_url": url, "upstream_body": r.text[:800]})
+
+# ────────────────────────────── Funciones Power BI (núcleo)
+def _pb_list_datasets() -> list:
+    data = _pbi_get("/admin/datasets?$top=5000")
+    return data.get("value", [])
+
+def _pb_list_workspaces() -> list:
+    data = _pbi_get("/admin/groups?$top=5000")
+    return data.get("value", [])
+
+def _pb_list_reports(workspace_id: str) -> list:
+    data = _pbi_get(f"/groups/{workspace_id}/reports")
+    return data.get("value", [])
+
+def _pb_list_workspace_users(workspace_id: str) -> list:
+    data = _pbi_get(f"/admin/groups/{workspace_id}/users")
+    return data.get("value", [])
+
+def _pb_dataset_detail(workspace_id: str, dataset_id: str) -> dict:
+    expand = "$expand=tables,measures,relationships"
+    return _pbi_get(f"/groups/{workspace_id}/datasets/{dataset_id}?{expand}")
+
+def _pb_list_lakehouses(workspace_id: str) -> list:
+    try:
+        data = _pbi_get(f"/groups/{workspace_id}/lakehouses")
+        return data.get("value", [])
+    except HTTPException as e:
+        if e.status_code == 404:
+            return []
+        raise
+
+def _pb_lakehouse_detail(workspace_id: str, lakehouse_id: str) -> dict:
+    return _pbi_get(f"/groups/{workspace_id}/lakehouses/{lakehouse_id}")
+
+QS = (
+    "?lineage=true&datasourceDetails=true"
+    "&datasetSchema=true&datasetExpressions=true&getArtifactUsers=true"
+)
+
+def _pb_scan_workspace(workspace_ids: List[str]) -> str:
+    data = _pbi_post(f"/admin/workspaces/getInfo{QS}", {"workspaces": workspace_ids})
+    scan_id = data.get("id")
+    if not scan_id:
+        raise HTTPException(status_code=502, detail={"unexpected_body": data})
+    return scan_id
+
+def _pb_scan_status(scan_id: str) -> str:
+    data = _pbi_get(f"/admin/workspaces/scanStatus/{scan_id}")
+    return data.get("status", "Unknown")
+
+def _pb_scan_result(scan_id: str):
+    return _pbi_get(f"/admin/workspaces/scanResult/{scan_id}")
+
+# — Catálogo enriquecido -------------------------------------------------------
+def _pb_catalog_to_csv(scan_id: str) -> str:
+    data = _pb_scan_result(scan_id)
+    rows = []
+    for ws in data.get("workspaces", []):
+        for usr in ws.get("users", []):
+            rows.append({
+                "Workspace": ws["name"], "Dataset": "", "Table": "",
+                "Field": usr["displayName"], "Kind": "WorkspaceUser",
+                "DataType": usr.get("principalType"),
+                "Expression": usr.get("groupUserAccessRight"),
+            })
+        for ds in ws.get("datasets", []):
+            for tbl in ds.get("tables", []):
+                for col in tbl.get("columns", []):
+                    rows.append({
+                        "Workspace": ws["name"], "Dataset": ds["name"],
+                        "Table": tbl["name"], "Field": col["name"],
+                        "Kind": "Column", "DataType": col.get("dataType"),
+                        "Expression": "",
+                    })
+            for msr in ds.get("measures", []):
+                rows.append({
+                    "Workspace": ws["name"], "Dataset": ds["name"],
+                    "Table": msr.get("table", ""), "Field": msr["name"],
+                    "Kind": "Measure", "DataType": "",
+                    "Expression": msr.get("expression", ""),
+                })
+    df = pd.DataFrame(rows)
+    temp = tempfile.gettempdir()
+    csv = os.path.join(temp, f"catalogo_{scan_id}.csv")
+    xlsx = os.path.join(temp, f"catalogo_{scan_id}.xlsx")
+    df.to_csv(csv, index=False, encoding="utf-8")
+    try:
+        df.to_excel(xlsx, index=False)
+    except Exception:
+        xlsx = "(requiere openpyxl instalado)"
+    return f"CSV → {csv}\nXLSX → {xlsx}"
+
+# ────────────────────────────── FastMCP tools (sin Context)
+mcp = FastMCP("PowerBI-Admin-API")
+
+@mcp.tool()
+def list_datasets() -> str:
+    return json.dumps(_pb_list_datasets(), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def list_workspaces() -> str:
+    return json.dumps(_pb_list_workspaces(), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def list_reports(workspace_id: str) -> str:
+    return json.dumps(_pb_list_reports(workspace_id), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def list_workspace_users(workspace_id: str) -> str:
+    return json.dumps(_pb_list_workspace_users(workspace_id), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def dataset_detail(workspace_id: str, dataset_id: str) -> str:
+    return json.dumps(_pb_dataset_detail(workspace_id, dataset_id), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def list_lakehouses(workspace_id: str) -> str:
+    return json.dumps(_pb_list_lakehouses(workspace_id), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def lakehouse_detail(workspace_id: str, lakehouse_id: str) -> str:
+    return json.dumps(_pb_lakehouse_detail(workspace_id, lakehouse_id), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def scan_workspace(workspace_ids: List[str]) -> str:
+    return _pb_scan_workspace(workspace_ids)
+
+@mcp.tool()
+def scan_status(scan_id: str) -> str:
+    return _pb_scan_status(scan_id)
+
+@mcp.tool()
+def scan_result(scan_id: str) -> str:
+    res = _pb_scan_result(scan_id)
+    if isinstance(res, str):
+        return res
+    return json.dumps(res, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def catalog_to_csv(scan_id: str) -> str:
+    return _pb_catalog_to_csv(scan_id)
+
+# ────────────────────────────── Montar sub-app MCP
+mcp_sub_app = mcp.http_app()
+app.mount("/_mcp", mcp_sub_app)
+
+# ────────────────────────────── Modelos Pydantic (REST)
+class WorkspaceReq(BaseModel):
+    workspace_id: str = Field(..., description="GUID del workspace")
+
+class WorkspaceUsersReq(BaseModel):
+    workspace_id: str = Field(..., description="GUID del workspace para usuarios")
+
+class DatasetDetailReq(BaseModel):
+    workspace_id: str = Field(..., description="GUID del workspace")
+    dataset_id: str = Field(..., description="GUID del dataset")
+
+class LakehouseDetailReq(BaseModel):
+    workspace_id: str = Field(..., description="GUID del workspace")
+    lakehouse_id: str = Field(..., description="GUID del lakehouse")
+
+class ScanWorkspaceReq(BaseModel):
+    workspace_ids: List[str] = Field(..., description="Lista de GUIDs de workspaces (1..n)")
+    @field_validator("workspace_ids")
+    @classmethod
+    def _no_empty(cls, v):
+        if not v:
+            raise ValueError("workspace_ids no puede estar vacío")
+        return v
+
+class ScanIdReq(BaseModel):
+    scan_id: str = Field(..., description="GUID del scan devuelto por scan_workspace")
+
+# ────────────────────────────── Router REST (SIN aprobaciones)
+tools_router = APIRouter(prefix="/mcp/tools", tags=["Power BI Admin"])
+
+# POST (lectura) + GET espejos (POST sin body requerido en OpenAPI)
+@tools_router.post("/list_workspaces", summary="Lista workspaces (Admin)")
+def http_list_workspaces():
+    return _pb_list_workspaces()
+@tools_router.get("/list_workspaces", summary="Lista workspaces (Admin) [GET]")
+def http_list_workspaces_get():
+    return _pb_list_workspaces()
+
+@tools_router.post("/list_datasets", summary="Lista datasets (Admin)")
+def http_list_datasets():
+    return _pb_list_datasets()
+@tools_router.get("/list_datasets", summary="Lista datasets (Admin) [GET]")
+def http_list_datasets_get():
+    return _pb_list_datasets()
+
+@tools_router.post("/list_reports", summary="Lista reports de un workspace")
+def http_list_reports(payload: WorkspaceReq):
+    return _pb_list_reports(payload.workspace_id)
+@tools_router.get("/list_reports", summary="Lista reports de un workspace [GET]")
+def http_list_reports_get(workspace_id: str):
+    return _pb_list_reports(workspace_id)
+
+@tools_router.post("/list_workspace_users", summary="Lista usuarios y permisos de un workspace")
+def http_list_workspace_users(payload: WorkspaceUsersReq):
+    return _pb_list_workspace_users(payload.workspace_id)
+@tools_router.get("/list_workspace_users", summary="Lista usuarios y permisos de un workspace [GET]")
+def http_list_workspace_users_get(workspace_id: str):
+    return _pb_list_workspace_users(workspace_id)
+
+@tools_router.post("/dataset_detail", summary="Detalle completo de un dataset")
+def http_dataset_detail(payload: DatasetDetailReq):
+    return _pb_dataset_detail(payload.workspace_id, payload.dataset_id)
+@tools_router.get("/dataset_detail", summary="Detalle completo de un dataset [GET]")
+def http_dataset_detail_get(workspace_id: str, dataset_id: str):
+    return _pb_dataset_detail(workspace_id, dataset_id)
+
+@tools_router.post("/list_lakehouses", summary="Lista lakehouses de un workspace")
+def http_list_lakehouses(payload: WorkspaceReq):
+    return _pb_list_lakehouses(payload.workspace_id)
+@tools_router.get("/list_lakehouses", summary="Lista lakehouses de un workspace [GET]")
+def http_list_lakehouses_get(workspace_id: str):
+    return _pb_list_lakehouses(workspace_id)
+
+@tools_router.post("/lakehouse_detail", summary="Detalle de un lakehouse")
+def http_lakehouse_detail(payload: LakehouseDetailReq):
+    return _pb_lakehouse_detail(payload.workspace_id, payload.lakehouse_id)
+@tools_router.get("/lakehouse_detail", summary="Detalle de un lakehouse [GET]")
+def http_lakehouse_detail_get(workspace_id: str, lakehouse_id: str):
+    return _pb_lakehouse_detail(workspace_id, lakehouse_id)
+
+@tools_router.post("/scan_workspace", summary="Inicia escaneo detallado de workspaces")
+def http_scan_workspace(payload: ScanWorkspaceReq):
+    scan_id = _pb_scan_workspace(payload.workspace_ids)
+    return {"scan_id": scan_id}
+
+@tools_router.post("/scan_status", summary="Estado del escaneo")
+def http_scan_status(payload: ScanIdReq):
+    status = _pb_scan_status(payload.scan_id)
+    return {"status": status}
+@tools_router.get("/scan_status", summary="Estado del escaneo [GET]")
+def http_scan_status_get(scan_id: str):
+    status = _pb_scan_status(scan_id)
+    return {"status": status}
+
+@tools_router.post("/scan_result", summary="Resultado completo del escaneo (JSON)")
+def http_scan_result(payload: ScanIdReq):
+    return _pb_scan_result(payload.scan_id)
+@tools_router.get("/scan_result", summary="Resultado completo del escaneo (JSON) [GET]")
+def http_scan_result_get(scan_id: str):
+    return _pb_scan_result(scan_id)
+
+@tools_router.post("/catalog_to_csv", summary="Exporta catálogo (CSV/XLSX) desde un scan finalizado")
+def http_catalog_to_csv(payload: ScanIdReq):
+    res = _pb_catalog_to_csv(payload.scan_id)
+    return {"result": res}
+
+app.include_router(tools_router)
+
+# ────────────────────────────── Depuración
+@app.get("/debug/routes", response_class=PlainTextResponse)
+def debug_routes():
+    lines = ["=== RUTAS APP ===\n"]
+    for r in app.routes:
+        methods = getattr(r, "methods", None)
+        lines.append(f"{r.path} {methods}\n")
+    return "".join(lines)
+
+# ────────────────────────────── OpenAPI extendido (marca no-consecuenciales + POST sin body)
+@app.on_event("startup")
+def build_openapi_schema() -> None:
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+        description=app.description,
+    )
+    schema["openapi"] = "3.1.0"
+    schema["servers"] = [{"url": SERVER_URL}]
+
+    # No documentamos OPTIONS wildcard
+    schema.get("paths", {}).pop("/{path}", None)
+    if "/" in schema.get("paths", {}) and "head" in schema["paths"]["/"]:
+        schema["paths"]["/"].pop("head", None)
+
+    READ_ONLY = {
+        ("get", "/"), ("get", "/ping"), ("get", "/debug/routes"),
+        ("get", "/mcp/tools/list_workspaces"), ("post", "/mcp/tools/list_workspaces"),
+        ("get", "/mcp/tools/list_datasets"), ("post", "/mcp/tools/list_datasets"),
+        ("get", "/mcp/tools/list_reports"), ("post", "/mcp/tools/list_reports"),
+        ("get", "/mcp/tools/list_workspace_users"), ("post", "/mcp/tools/list_workspace_users"),
+        ("get", "/mcp/tools/dataset_detail"), ("post", "/mcp/tools/dataset_detail"),
+        ("get", "/mcp/tools/list_lakehouses"), ("post", "/mcp/tools/list_lakehouses"),
+        ("get", "/mcp/tools/lakehouse_detail"), ("post", "/mcp/tools/lakehouse_detail"),
+        ("get", "/mcp/tools/scan_status"), ("post", "/mcp/tools/scan_status"),
+        ("get", "/mcp/tools/scan_result"), ("post", "/mcp/tools/scan_result"),
+        ("post", "/mcp/tools/catalog_to_csv"),
+    }
+
+    for path, item in schema.get("paths", {}).items():
+        for method, op in list(item.items()):
+            m = method.lower()
+            if m in ("get", "post", "put", "patch", "delete"):
+                key = (m, path)
+                if key in READ_ONLY:
+                    op["x-openai-isConsequential"] = False
+                if m == "post" and "requestBody" in op:
+                    # Permite POST sin body para que el Builder no exija payload
+                    op["requestBody"]["required"] = False
+
+    app.openapi_schema = schema
+    with open("openapi.json", "w", encoding="utf-8") as f:
+        json.dump(schema, f, ensure_ascii=False, indent=2)
+
+@app.get("/openapi-full.json")
+def serve_full_openapi():
+    return JSONResponse(content=app.openapi())
 
