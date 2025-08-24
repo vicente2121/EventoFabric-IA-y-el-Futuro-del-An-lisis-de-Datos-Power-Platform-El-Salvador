@@ -1,0 +1,292 @@
+# mcp_pbix.py
+# Servidor MCP para analizar archivos PBIX (Power BI) desde Claude u otros clientes MCP.
+# Exponemos herramientas:
+# - analyze_visuals(pbix_path): uso de campos por visual (JSON)
+# - get_measures(pbix_path): medidas DAX (JSON)
+# - get_columns(pbix_path): columnas calculadas DAX (JSON)
+# - get_tables(pbix_path): tablas de modelo/Power Query/DAX (JSON)
+#
+# Requisitos:
+#   pip install "mcp[cli]" pandas pbixray
+#
+# Uso local (debug):
+#   mcp dev mcp_pbix.py
+# Instalación en Claude Desktop:
+#   mcp install mcp_pbix.py
+
+from __future__ import annotations
+
+import os
+import io
+import json
+import zipfile
+import shutil
+import tempfile
+from typing import List, Dict
+
+import pandas as pd
+from pbixray import PBIXRay
+
+# == MCP SDK ==
+# Si no lo tienes: pip install "mcp[cli]"
+from mcp.server.fastmcp import FastMCP
+
+
+# =========================
+# Utilidades PBIX / Visuales
+# =========================
+
+def _read_json_smart(fobj: io.BufferedReader | io.BytesIO) -> dict:
+    """
+    Lee JSON desde un file-like en binario intentando utf-8 y utf-16-le.
+    Devuelve dict (o lista), normalmente dict.
+    """
+    raw = fobj.read()
+    # Tratar de detectar BOM/encoding habitual de Layout
+    for enc in ("utf-8-sig", "utf-8", "utf-16-le", "utf-16"):
+        try:
+            return json.loads(raw.decode(enc))
+        except Exception:
+            pass
+    # Último intento: parsear como binario si ya es str (no debería llegar)
+    return json.loads(raw)
+
+
+def extract_roles(cfg: dict) -> Dict[str, str]:
+    roles: Dict[str, str] = {}
+    for role, items in cfg.get("singleVisual", {}).get("projections", {}).items():
+        for it in items:
+            ref = it.get("queryRef")
+            if ref:
+                roles[ref] = role
+    return roles
+
+
+def query_map(cfg: dict) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for sel in cfg.get("singleVisual", {}).get("prototypeQuery", {}).get("Select", []):
+        expr = sel.get("Measure") or sel.get("Column")
+        if isinstance(expr, dict):
+            src = expr.get("Expression", {}).get("SourceRef", {})
+            ent = src.get("Entity") or src.get("Source")
+            prop = expr.get("Property")
+            name = sel.get("Name")
+            if ent and prop and name:
+                full = f"{ent}.{prop}"
+                mapping[prop] = full
+                mapping[full] = full
+                mapping[name] = full
+    return mapping
+
+
+def gather_fields(cfg: dict) -> set[str]:
+    fields: set[str] = set()
+
+    def _walk(node):
+        if isinstance(node, dict):
+            qr = node.get("queryRef")
+            if qr:
+                fields.add(qr)
+            for key in ("Measure", "Column"):
+                m = node.get(key)
+                if m and isinstance(m, dict):
+                    src = m.get("Expression", {}).get("SourceRef", {})
+                    ent = src.get("Entity") or src.get("Source")
+                    prop = m.get("Property")
+                    if ent and prop:
+                        fields.add(f"{ent}.{prop}")
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(cfg)
+    return fields
+
+
+def titles(cfg: dict) -> Dict[str, str]:
+    ts_map: Dict[str, str] = {}
+    vc: dict = {}
+    for part in (cfg.get("vcObjects", {}), cfg.get("singleVisual", {}).get("vcObjects", {})):
+        if isinstance(part, dict):
+            vc.update(part)
+    for kind, label in [("title", "Título"), ("subTitle", "Subtítulo")]:
+        for item in vc.get(kind, []):
+            expr = item.get("properties", {}).get("text", {}).get("expr", {})
+            m = expr.get("Measure") or expr.get("Column")
+            if isinstance(m, dict):
+                src = m.get("Expression", {}).get("SourceRef", {})
+                ent = src.get("Entity") or src.get("Source")
+                prop = m.get("Property")
+                if ent and prop:
+                    ts_map[f"{ent}.{prop}"] = label
+    return ts_map
+
+
+def has_order(cfg: dict, field: str) -> bool:
+    for o in cfg.get("singleVisual", {}).get("prototypeQuery", {}).get("OrderBy", []):
+        expr = o.get("Expression", {})
+        for key in ("Measure", "Column"):
+            m = expr.get(key)
+            if m and isinstance(m, dict):
+                src = m.get("Expression", {}).get("SourceRef", {})
+                ent = src.get("Entity") or src.get("Source")
+                prop = m.get("Property")
+                if ent and prop and field == f"{ent}.{prop}":
+                    return True
+    return False
+
+
+def detect_use(field: str, cfg: dict, roles: Dict[str, str], ts_map: Dict[str, str]) -> List[str]:
+    if field in ts_map:
+        return [ts_map[field]]
+
+    usos: List[str] = []
+    if field in roles:
+        usos.append(roles[field])
+
+    for lbl_list in (
+        cfg.get("singleVisual", {}).get("objects", {}).get("labels", []),
+        cfg.get("dataTransforms", {}).get("objects", {}).get("labels", []),
+    ):
+        for lbl in lbl_list:
+            props = lbl.get("properties", {})
+            for dyn_key in ("dynamicLabelDetail", "dynamicLabelValue"):
+                dyn = props.get(dyn_key, {}).get("expr", {})
+                meas = dyn.get("Measure")
+                if isinstance(meas, dict):
+                    p = meas.get("Property")
+                    src = meas.get("Expression", {}).get("SourceRef", {})
+                    ent = src.get("Entity") or src.get("Source")
+                    if p and ent and field == f"{ent}.{p}":
+                        usos.append("Etiqueta dinámica")
+
+    if has_order(cfg, field):
+        usos.append("Ordenamiento")
+
+    return usos or ["Otro/alias"]
+
+
+def analizar_visuales(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No existe el archivo: {path}")
+    if not zipfile.is_zipfile(path):
+        # Un .pbix es un ZIP; si no lo es, pbix corrupto o extensión distinta.
+        raise ValueError("El archivo no tiene formato ZIP (¿PBIX corrupto?).")
+
+    tmpdir = tempfile.mkdtemp(prefix="pbixray_")
+    try:
+        with zipfile.ZipFile(path) as z:
+            z.extractall(tmpdir)
+
+        layout_path = os.path.join(tmpdir, "Report", "Layout")
+        if not os.path.exists(layout_path):
+            # Algunos PBIX guardan Layout como "Layout.json"
+            alt = os.path.join(tmpdir, "Report", "Layout.json")
+            if os.path.exists(alt):
+                layout_path = alt
+            else:
+                raise FileNotFoundError("No se encontró Report/Layout en el PBIX.")
+
+        with open(layout_path, "rb") as f:
+            layout = _read_json_smart(f)
+
+        resultado: List[Dict[str, str]] = []
+        for sec in layout.get("sections", []):
+            pagina = sec.get("displayName") or sec.get("name") or "Página"
+            for vc in sec.get("visualContainers", []):
+                cfg_text = vc.get("config") or "{}"
+                if isinstance(cfg_text, str):
+                    try:
+                        cfg = json.loads(cfg_text)
+                    except Exception:
+                        # Algunos guardan JSON con escapes dobles; reintento
+                        cfg = json.loads(cfg_text.encode("utf-8", "ignore").decode("utf-8", "ignore"))
+                else:
+                    cfg = {}
+
+                nombre = cfg.get("name") or vc.get("name") or "Visual"
+                tipo = cfg.get("singleVisual", {}).get("visualType", "?")
+                roles = extract_roles(cfg)
+                qmap = query_map(cfg)
+                ts_map = titles(cfg)
+                fields = sorted({qmap.get(f, f) for f in gather_fields(cfg)})
+
+                for campo in fields:
+                    usos = detect_use(campo, cfg, roles, ts_map)
+                    resultado.append(
+                        {
+                            "Página": pagina,
+                            "Visual": nombre,
+                            "TipoVisual": tipo,
+                            "Campo": campo,
+                            "Usos": ", ".join(usos),
+                        }
+                    )
+        return pd.DataFrame(resultado)
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def cargar_modelo(path: str) -> PBIXRay:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No existe el archivo: {path}")
+    return PBIXRay(path)
+
+
+# =========================
+# Servidor MCP y herramientas
+# =========================
+
+mcp = FastMCP("PBIX Inspector")
+
+
+@mcp.tool()
+def analyze_visuals(pbix_path: str) -> List[Dict]:
+    """Devuelve el uso de campos por visual de un PBIX en formato JSON (lista de dicts)."""
+    df = analizar_visuales(pbix_path)
+    return df.to_dict(orient="records")
+
+
+@mcp.tool()
+def get_measures(pbix_path: str) -> List[Dict]:
+    """Devuelve las medidas DAX del PBIX como lista de dicts (JSON)."""
+    model = cargar_modelo(pbix_path)
+    # model.dax_measures suele tener columnas como: TableName, MeasureName, Expression, etc.
+    return model.dax_measures.to_dict(orient="records")
+
+
+@mcp.tool()
+def get_columns(pbix_path: str) -> List[Dict]:
+    """Devuelve las columnas calculadas DAX del PBIX como lista de dicts (JSON)."""
+    model = cargar_modelo(pbix_path)
+    return model.dax_columns.to_dict(orient="records")
+
+
+@mcp.tool()
+def get_tables(pbix_path: str) -> Dict[str, List[str]]:
+    """Devuelve las tablas del modelo (modelo, Power Query y DAX) como JSON."""
+    model = cargar_modelo(pbix_path)
+    tablas_modelo = sorted(set(model.tables.tolist()))
+    tablas_query = sorted(set(model.power_query["TableName"].unique()))
+    tablas_dax = sorted([] if model.dax_tables.empty else model.dax_tables["TableName"].unique().tolist())
+    return {
+        "modelo": tablas_modelo,
+        "power_query": tablas_query,
+        "dax": tablas_dax,
+    }
+
+
+# =========================
+# Arranque del servidor MCP
+# =========================
+
+if __name__ == "__main__":
+    # Ejecuta el servidor MCP por stdio (compatible con Claude Desktop).
+    # Para probar en local:
+    #   mcp dev mcp_pbix.py
+    # Para instalar en Claude Desktop:
+    #   mcp install mcp_pbix.py
+    mcp.run()
